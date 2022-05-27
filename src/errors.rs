@@ -1,5 +1,5 @@
 /**
- * Copyright 2020 Confluent Inc.
+ * Copyright 2022 BWSoft Management, Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,4 +23,10 @@ pub enum ConfigLoadErrors {
     ValueCastError(&'static str, &'static str),
     #[error("Unable to load HOCON configuration. Error is: ${0}")]
     HoconLoadError(hocon::Error),
+}
+
+#[derive(Error, Debug)]
+pub enum ConfigError {
+    #[error("Key `{0}` doesn't exist!")]
+    KeyDoesNotExist(String),
 }

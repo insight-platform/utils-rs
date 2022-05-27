@@ -1,5 +1,5 @@
 /**
- * Copyright 2020 Confluent Inc.
+ * Copyright 2022 BWSoft Management, Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -63,7 +63,7 @@ impl HoconClient {
 
     pub fn fetch_u64(&self, path: &'static str) -> Result<u64> {
         u64::try_from(self.fetch_i64(path)?)
-            .or_else(|_| Err(ConfigLoadErrors::ValueCastError(path, "i64->u64").into()))
+            .map_err(|_| ConfigLoadErrors::ValueCastError(path, "i64->u64").into())
     }
 }
 
