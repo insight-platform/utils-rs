@@ -274,7 +274,7 @@ impl ConfClient {
             let res =
                 tokio::time::timeout(Duration::from_secs(WATCH_WAIT_TTL), inbound.next()).await;
 
-            if let Ok(_) = res {
+            if res.is_ok() {
                 let res = self.fetch_vars(&var_spec).await?;
                 watch_result.notify(res).await?;
             }
