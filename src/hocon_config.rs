@@ -26,10 +26,10 @@ pub struct HoconClient {
 }
 
 impl HoconClient {
-    pub fn load(path: &Path) -> Result<HoconClient> {
+    pub fn load(path: &str) -> Result<HoconClient> {
         debug!("CWD is: {:?}", current_dir().unwrap());
         info!("Loading config from the path {:?}", &path);
-        let load = HoconLoader::new().load_file(path);
+        let load = HoconLoader::new().load_file(Path::new(path));
         match load {
             Ok(loader) => match loader.hocon() {
                 Ok(hocon) => Ok(HoconClient { hocon }),
@@ -71,11 +71,10 @@ impl HoconClient {
 mod tests {
     use crate::hocon_config::HoconClient;
     use anyhow::Result;
-    use std::path::Path;
 
     #[test]
     fn test_config_load() -> Result<()> {
-        let c = HoconClient::load(Path::new("./assets/test_hocon.conf"))?;
+        let c = HoconClient::load("./assets/test_hocon.conf")?;
 
         #[allow(dead_code)]
         struct Conf {
