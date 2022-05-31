@@ -17,3 +17,4 @@ pub mod etcd_conf;
  */
 pub mod hocon_config;
 pub mod kafka_config;
+pub mod mqtt;
