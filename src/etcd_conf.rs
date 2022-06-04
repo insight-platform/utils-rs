@@ -27,7 +27,7 @@ const WATCH_WAIT_TTL: u64 = 1;
 
 #[async_trait]
 pub trait WatchResult {
-    async fn notify(&mut self, res: Vec<Operation>) -> Result<()>;
+    async fn notify(&mut self, res: Operation) -> Result<()>;
 }
 
 #[async_trait]
@@ -36,8 +36,8 @@ pub trait KVOperator {
 }
 
 pub struct ConfClient {
-    path: String,
     client: Client,
+    watcher: (Watcher, WatchStream),
     lease_timeout: i64,
     lease_id: Option<i64>,
 }
@@ -91,7 +91,7 @@ impl VarPathSpec {
         )
     }
 
-    async fn get(&self, client: &mut Client) -> Result<(String, String)> {
+    pub async fn get(&self, client: &mut Client) -> Result<(String, String)> {
         match self {
             VarPathSpec::SingleVar(key) => {
                 let resp = client.get(key.as_bytes(), None).await?;
@@ -114,7 +114,7 @@ impl VarPathSpec {
         }
     }
 
-    async fn get_prefix(&self, client: &mut Client) -> Result<Vec<(String, String)>> {
+    pub async fn get_prefix(&self, client: &mut Client) -> Result<Vec<(String, String)>> {
         match self {
             VarPathSpec::Prefix(key) => {
                 let resp = client
@@ -145,7 +145,7 @@ impl ConfClient {
         connect_timeout: u64,
     ) -> Result<ConfClient> {
         info!("Connecting to {:?} etcd server", &uris);
-        let client = Client::connect(
+        let mut client = Client::connect(
             uris,
             Some({
                 let mut opts = ConnectOptions::new();
@@ -157,15 +157,24 @@ impl ConfClient {
         )
         .await?;
 
+        let watch_path = path.clone();
+        info!("Watching for {} for configuration changes", &watch_path);
+        let (watcher, watch_stream) = client
+            .watch(watch_path, Some(WatchOptions::new().with_prefix()))
+            .await?;
+
         Ok(ConfClient {
-            path,
             client,
+            watcher: (watcher, watch_stream),
             lease_timeout,
             lease_id: None,
         })
     }
 
-    async fn fetch_vars(&mut self, var_spec: &Vec<VarPathSpec>) -> Result<Vec<(String, String)>> {
+    pub async fn fetch_vars(
+        &mut self,
+        var_spec: &Vec<VarPathSpec>,
+    ) -> Result<Vec<(String, String)>> {
         let mut res = Vec::default();
         for v in var_spec {
             match v {
@@ -225,32 +234,24 @@ impl ConfClient {
 
     pub async fn monitor(
         &mut self,
-        var_spec: Vec<VarPathSpec>,
+        // var_spec: Vec<VarPathSpec>,
         watch_result: &mut dyn WatchResult,
         kv_operator: &mut dyn KVOperator,
     ) -> Result<()> {
-        info!("Starting watching for changes on {}", self.path);
+        info!("Starting watching for changes on {:?}", self.watcher);
 
-        let res = self
-            .fetch_vars(&var_spec)
-            .await?
-            .iter()
-            .map(|(k, v)| Operation::Set {
-                key: k.clone(),
-                value: v.clone(),
-                with_lease: false,
-            })
-            .collect();
-
-        watch_result.notify(res).await?;
-
-        let watch_path = self.path.clone();
-
-        info!("Watching for {} for configuration changes", &watch_path);
-        let (_watcher, mut inbound) = self
-            .client
-            .watch(watch_path, Some(WatchOptions::new().with_prefix()))
-            .await?;
+        // let res = self
+        //     .fetch_vars(&var_spec)
+        //     .await?
+        //     .iter()
+        //     .map(|(k, v)| Operation::Set {
+        //         key: k.clone(),
+        //         value: v.clone(),
+        //         with_lease: false,
+        //     })
+        //     .collect();
+        //
+        // watch_result.notify(res).await?;
 
         if self.lease_id.is_none() {
             let lease = self.client.lease_grant(self.lease_timeout, None).await?;
@@ -260,8 +261,11 @@ impl ConfClient {
         loop {
             self.client.lease_keep_alive(self.lease_id.unwrap()).await?;
 
-            let res =
-                tokio::time::timeout(Duration::from_secs(WATCH_WAIT_TTL), inbound.message()).await;
+            let res = tokio::time::timeout(
+                Duration::from_secs(WATCH_WAIT_TTL),
+                self.watcher.1.message(),
+            )
+            .await;
 
             if let Ok(res) = res {
                 if let Some(resp) = res? {
@@ -271,27 +275,29 @@ impl ConfClient {
                         info!("Etcd datcher was successfully deployed.");
                     }
 
-                    let mut ops = Vec::default();
                     for event in resp.events() {
                         if EventType::Delete == event.event_type() {
                             if let Some(kv) = event.kv() {
-                                ops.push(Operation::DelKey {
-                                    key: kv.key_str()?.into(),
-                                })
+                                watch_result
+                                    .notify(Operation::DelKey {
+                                        key: kv.key_str()?.into(),
+                                    })
+                                    .await?;
                             }
                         }
 
                         if EventType::Put == event.event_type() {
                             if let Some(kv) = event.kv() {
-                                ops.push(Operation::Set {
-                                    key: kv.key_str()?.to_string(),
-                                    value: kv.value_str()?.to_string(),
-                                    with_lease: kv.lease() != 0,
-                                })
+                                watch_result
+                                    .notify(Operation::Set {
+                                        key: kv.key_str()?.to_string(),
+                                        value: kv.value_str()?.to_string(),
+                                        with_lease: kv.lease() != 0,
+                                    })
+                                    .await?;
                             }
                         }
                     }
-                    watch_result.notify(ops).await?;
                 } else {
                     return Ok(());
                 }
@@ -308,6 +314,7 @@ mod tests {
     use crate::etcd_conf::{ConfClient, KVOperator, Operation, VarPathSpec, WatchResult};
     use anyhow::Result;
     use async_trait::async_trait;
+    use log::info;
     use std::time::Duration;
 
     #[tokio::test]
@@ -363,55 +370,57 @@ mod tests {
 
         #[derive(Default)]
         struct Watcher {
-            new_leased: Operation,
+            counter: i32,
+            watch_result: Operation,
         }
 
         #[async_trait]
         impl WatchResult for Watcher {
-            async fn notify(&mut self, res: Vec<Operation>) -> Result<()> {
-                self.new_leased = res.first().unwrap().clone();
+            async fn notify(&mut self, res: Operation) -> Result<()> {
+                info!("Operation: {:?}", &res);
+                self.counter += 1;
+                self.watch_result = res;
                 Ok(())
             }
         }
 
-        struct Operator;
+        struct Operator {
+            operation: Option<Operation>,
+        }
 
         #[async_trait]
         impl KVOperator for Operator {
             async fn ops(&mut self) -> Result<Vec<Operation>> {
-                Ok(vec![Operation::Set {
-                    key: "local/node/leased".into(),
-                    value: "new_leased".into(),
-                    with_lease: true,
-                }])
+                let op: Vec<_> = self.operation.take().into_iter().collect();
+                Ok(op)
             }
         }
 
         let mut w = Watcher::default();
-        let mut o = Operator {};
+        let mut o = Operator {
+            operation: Some(Operation::Set {
+                key: "local/node/leased".into(),
+                value: "new_leased".into(),
+                with_lease: true,
+            }),
+        };
 
-        match tokio::time::timeout(
-            Duration::from_secs(5),
-            client.monitor(
-                vec![VarPathSpec::SingleVar("local/node/leased".into())],
-                &mut w,
-                &mut o,
-            ),
-        )
-        .await
-        {
+        // vec![VarPathSpec::SingleVar("local/node/leased".into())]
+
+        match tokio::time::timeout(Duration::from_secs(5), client.monitor(&mut w, &mut o)).await {
             Ok(res) => {
                 panic!("Unexpected termination occurred: {:?}", res);
             }
             Err(_) => {
                 assert_eq!(
-                    w.new_leased,
+                    w.watch_result,
                     Operation::Set {
                         key: "local/node/leased".into(),
                         value: "new_leased".into(),
                         with_lease: true,
                     }
                 );
+                assert_eq!(w.counter, 3);
             }
         }
 
