@@ -9,5 +9,5 @@ services:
     environment:
       - ALLOW_NONE_AUTHENTICATION=no
       - ETCD_ROOT_PASSWORD=secret
-      - ETCD_ADVERTISE_CLIENT_URLS=http://10.0.0.1:22379
-      - ETCD_LISTEN_CLIENT_URLS=http://0.0.0.0:22379
+      - ETCD_ADVERTISE_CLIENT_URLS=http://10.0.0.1:2379
+      - ETCD_LISTEN_CLIENT_URLS=http://0.0.0.0:2379

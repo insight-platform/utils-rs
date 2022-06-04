@@ -18,8 +18,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use etcd_rs::*;
-use futures::StreamExt;
+use etcd_client::*;
 
 use crate::errors::ConfigError;
 use log::{info, warn};
@@ -28,7 +27,7 @@ const WATCH_WAIT_TTL: u64 = 1;
 
 #[async_trait]
 pub trait WatchResult {
-    async fn notify(&mut self, res: Vec<(String, String)>) -> Result<()>;
+    async fn notify(&mut self, res: Vec<Operation>) -> Result<()>;
 }
 
 #[async_trait]
@@ -39,10 +38,11 @@ pub trait KVOperator {
 pub struct ConfClient {
     path: String,
     client: Client,
-    lease_timeout: u64,
-    lease_id: Option<u64>,
+    lease_timeout: i64,
+    lease_id: Option<i64>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
 pub enum Operation {
     Set {
         key: String,
@@ -55,6 +55,13 @@ pub enum Operation {
     DelPrefix {
         prefix: String,
     },
+    Nope,
+}
+
+impl Default for Operation {
+    fn default() -> Self {
+        Operation::Nope
+    }
 }
 
 #[derive(Debug)]
@@ -84,25 +91,21 @@ impl VarPathSpec {
         )
     }
 
-    async fn get(&self, client: &Client) -> Result<(String, String)> {
+    async fn get(&self, client: &mut Client) -> Result<(String, String)> {
         match self {
             VarPathSpec::SingleVar(key) => {
-                let v = client
-                    .kv()
-                    .range(RangeRequest::new(KeyRange::key(key.as_str())))
-                    .await;
-                match v {
-                    Ok(mut res) if res.count() == 1 => {
-                        let kv = res.take_kvs();
+                let resp = client.get(key.as_bytes(), None).await?;
+                match resp.kvs().first() {
+                    Some(res) => {
                         info!(
                             "Etcd Get: Key={}, Value={}",
-                            &key,
-                            kv.first().unwrap().value_str()
+                            res.key_str()?,
+                            res.value_str()?
                         );
-                        Ok((key.clone(), kv.first().unwrap().value_str().into()))
+                        Ok((res.key_str()?.to_string(), res.value_str()?.to_string()))
                     }
-                    r => {
-                        warn!("Error occurred: {:?}", r);
+                    None => {
+                        warn!("No value found for key: {:?}", key);
                         Err(ConfigError::KeyDoesNotExist(key.clone()).into())
                     }
                 }
@@ -111,34 +114,22 @@ impl VarPathSpec {
         }
     }
 
-    async fn get_prefix(&self, client: &Client) -> Result<Vec<(String, String)>> {
+    async fn get_prefix(&self, client: &mut Client) -> Result<Vec<(String, String)>> {
         match self {
             VarPathSpec::Prefix(key) => {
-                let v = client
-                    .kv()
-                    .range(RangeRequest::new(KeyRange::prefix(key.as_str())))
-                    .await;
-                match v {
-                    Ok(mut res) => {
-                        let kv = res.take_kvs();
-                        let res: Vec<(String, String)> = kv
-                            .iter()
-                            .map(|e| {
-                                info!(
-                                    "Etcd Get Prefix: Key={}, Value={}",
-                                    e.key_str(),
-                                    e.value_str()
-                                );
-                                (e.key_str().into(), e.value_str().into())
-                            })
-                            .collect();
-                        Ok(res)
-                    }
-                    Err(e) => {
-                        warn!("Error occurred: {:?}", e);
-                        Err(ConfigError::KeyDoesNotExist(key.clone()).into())
-                    }
+                let resp = client
+                    .get(key.as_bytes(), Some(GetOptions::new().with_prefix()))
+                    .await?;
+                let mut result = Vec::default();
+                for kv in resp.kvs() {
+                    info!(
+                        "Etcd Get Prefix: Key={}, Value={}",
+                        kv.key_str()?,
+                        kv.value_str()?
+                    );
+                    result.push((kv.key_str()?.to_string(), kv.value_str()?.to_string()));
                 }
+                Ok(result)
             }
             _ => panic!("get_prefix method is only defined for Prefix"),
         }
@@ -150,14 +141,20 @@ impl ConfClient {
         uris: Vec<String>,
         credentials: Option<(String, String)>,
         path: String,
-        lease_timeout: u64,
+        lease_timeout: i64,
+        connect_timeout: u64,
     ) -> Result<ConfClient> {
         info!("Connecting to {:?} etcd server", &uris);
-        let client = Client::connect(ClientConfig {
-            endpoints: uris,
-            auth: credentials,
-            tls: None,
-        })
+        let client = Client::connect(
+            uris,
+            Some({
+                let mut opts = ConnectOptions::new();
+                if let Some((user, password)) = credentials {
+                    opts = opts.with_user(user, password);
+                }
+                opts.with_timeout(Duration::from_secs(connect_timeout))
+            }),
+        )
         .await?;
 
         Ok(ConfClient {
@@ -168,16 +165,16 @@ impl ConfClient {
         })
     }
 
-    async fn fetch_vars(&self, var_spec: &Vec<VarPathSpec>) -> Result<Vec<(String, String)>> {
+    async fn fetch_vars(&mut self, var_spec: &Vec<VarPathSpec>) -> Result<Vec<(String, String)>> {
         let mut res = Vec::default();
         for v in var_spec {
             match v {
                 VarPathSpec::SingleVar(_) => {
-                    let value_pair = v.get(&self.client).await?;
+                    let value_pair = v.get(&mut self.client).await?;
                     res.push(value_pair);
                 }
                 VarPathSpec::Prefix(_) => {
-                    let mut value_pairs = v.get_prefix(&self.client).await?;
+                    let mut value_pairs = v.get_prefix(&mut self.client).await?;
                     res.append(&mut value_pairs);
                 }
             }
@@ -187,14 +184,7 @@ impl ConfClient {
 
     pub async fn kv_operations(&mut self, ops: Vec<Operation>) -> Result<()> {
         if self.lease_id.is_none() {
-            let lease = self
-                .client
-                .lease()
-                .grant(LeaseGrantRequest::new(Duration::from_secs(
-                    self.lease_timeout,
-                )))
-                .await?;
-
+            let lease = self.client.lease_grant(self.lease_timeout, None).await?;
             self.lease_id = Some(lease.id());
         }
 
@@ -203,31 +193,31 @@ impl ConfClient {
                 Operation::Set {
                     key,
                     value,
-                    with_lease: use_lease,
+                    with_lease,
                 } => {
                     self.client
-                        .kv()
-                        .put({
-                            let mut req = PutRequest::new(key, value);
-                            if use_lease {
-                                req.set_lease(self.lease_id.unwrap());
-                            }
-                            req
-                        })
+                        .put(
+                            key,
+                            value,
+                            Some({
+                                let mut opts = PutOptions::new();
+                                if with_lease {
+                                    opts = opts.with_lease(self.lease_id.unwrap());
+                                }
+                                opts
+                            }),
+                        )
                         .await?;
                 }
                 Operation::DelKey { key } => {
-                    self.client
-                        .kv()
-                        .delete(DeleteRequest::new(KeyRange::key(key)))
-                        .await?;
+                    self.client.delete(key, None).await?;
                 }
                 Operation::DelPrefix { prefix } => {
                     self.client
-                        .kv()
-                        .delete(DeleteRequest::new(KeyRange::prefix(prefix)))
+                        .delete(prefix, Some(DeleteOptions::new().with_prefix()))
                         .await?;
                 }
+                Operation::Nope => (),
             }
         }
         Ok(())
@@ -241,42 +231,70 @@ impl ConfClient {
     ) -> Result<()> {
         info!("Starting watching for changes on {}", self.path);
 
-        let res = self.fetch_vars(&var_spec).await?;
+        let res = self
+            .fetch_vars(&var_spec)
+            .await?
+            .iter()
+            .map(|(k, v)| Operation::Set {
+                key: k.clone(),
+                value: v.clone(),
+                with_lease: false,
+            })
+            .collect();
+
         watch_result.notify(res).await?;
 
         let watch_path = self.path.clone();
 
         info!("Watching for {} for configuration changes", &watch_path);
-        let mut inbound = self
+        let (_watcher, mut inbound) = self
             .client
-            .watch(KeyRange::prefix(watch_path))
-            .await
-            .unwrap();
+            .watch(watch_path, Some(WatchOptions::new().with_prefix()))
+            .await?;
 
         if self.lease_id.is_none() {
-            let lease = self
-                .client
-                .lease()
-                .grant(LeaseGrantRequest::new(Duration::from_secs(
-                    self.lease_timeout,
-                )))
-                .await?;
-
+            let lease = self.client.lease_grant(self.lease_timeout, None).await?;
             self.lease_id = Some(lease.id());
         }
 
         loop {
-            self.client
-                .lease()
-                .keep_alive(LeaseKeepAliveRequest::new(self.lease_id.unwrap()))
-                .await?;
+            self.client.lease_keep_alive(self.lease_id.unwrap()).await?;
 
             let res =
-                tokio::time::timeout(Duration::from_secs(WATCH_WAIT_TTL), inbound.next()).await;
+                tokio::time::timeout(Duration::from_secs(WATCH_WAIT_TTL), inbound.message()).await;
 
-            if res.is_ok() {
-                let res = self.fetch_vars(&var_spec).await?;
-                watch_result.notify(res).await?;
+            if let Ok(res) = res {
+                if let Some(resp) = res? {
+                    if resp.canceled() {
+                        return Ok(());
+                    } else if resp.created() {
+                        info!("Etcd datcher was successfully deployed.");
+                    }
+
+                    let mut ops = Vec::default();
+                    for event in resp.events() {
+                        if EventType::Delete == event.event_type() {
+                            if let Some(kv) = event.kv() {
+                                ops.push(Operation::DelKey {
+                                    key: kv.key_str()?.into(),
+                                })
+                            }
+                        }
+
+                        if EventType::Put == event.event_type() {
+                            if let Some(kv) = event.kv() {
+                                ops.push(Operation::Set {
+                                    key: kv.key_str()?.to_string(),
+                                    value: kv.value_str()?.to_string(),
+                                    with_lease: kv.lease() != 0,
+                                })
+                            }
+                        }
+                    }
+                    watch_result.notify(ops).await?;
+                } else {
+                    return Ok(());
+                }
             }
 
             let ops = kv_operator.ops().await?;
@@ -295,10 +313,11 @@ mod tests {
     #[tokio::test]
     async fn test_monitor() -> Result<()> {
         let mut client = ConfClient::new(
-            vec!["http://10.0.0.1:22379".into()],
-            None,
+            vec!["10.0.0.1:2379".into()],
+            Some(("root".to_string(), "secret".to_string())),
             "local/node".into(),
             5,
+            10,
         )
         .await?;
 
@@ -344,13 +363,13 @@ mod tests {
 
         #[derive(Default)]
         struct Watcher {
-            new_leased: String,
+            new_leased: Operation,
         }
 
         #[async_trait]
         impl WatchResult for Watcher {
-            async fn notify(&mut self, res: Vec<(String, String)>) -> Result<()> {
-                self.new_leased = res.first().unwrap().1.clone();
+            async fn notify(&mut self, res: Vec<Operation>) -> Result<()> {
+                self.new_leased = res.first().unwrap().clone();
                 Ok(())
             }
         }
@@ -385,7 +404,14 @@ mod tests {
                 panic!("Unexpected termination occurred: {:?}", res);
             }
             Err(_) => {
-                assert_eq!(w.new_leased, "new_leased".to_string());
+                assert_eq!(
+                    w.new_leased,
+                    Operation::Set {
+                        key: "local/node/leased".into(),
+                        value: "new_leased".into(),
+                        with_lease: true,
+                    }
+                );
             }
         }
 
