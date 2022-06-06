@@ -139,7 +139,7 @@ impl VarPathSpec {
 }
 
 impl ConfClient {
-    pub fn get_lease_id(&self) -> Option<i64> {
+    pub async fn get_lease_id(&self) -> Option<i64> {
         self.lease_id.clone()
     }
 
@@ -169,11 +169,13 @@ impl ConfClient {
             .watch(watch_path, Some(WatchOptions::new().with_prefix()))
             .await?;
 
+        let lease = client.lease_grant(lease_timeout, None).await?;
+
         Ok(ConfClient {
             client,
             watcher: (watcher, watch_stream),
             lease_timeout,
-            lease_id: None,
+            lease_id: Some(lease.id()),
         })
     }
 
@@ -198,11 +200,6 @@ impl ConfClient {
     }
 
     pub async fn kv_operations(&mut self, ops: Vec<Operation>) -> Result<()> {
-        if self.lease_id.is_none() {
-            let lease = self.client.lease_grant(self.lease_timeout, None).await?;
-            self.lease_id = Some(lease.id());
-        }
-
         for op in ops {
             match op {
                 Operation::Set {
