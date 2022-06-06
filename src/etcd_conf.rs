@@ -137,7 +137,7 @@ impl VarPathSpec {
 }
 
 impl ConfClient {
-    pub fn get_lease_(&self) -> Option<i64> {
+    pub fn get_lease_id(&self) -> Option<i64> {
         self.lease_id.clone()
     }
 
