@@ -240,8 +240,8 @@ impl ConfClient {
 
     pub async fn monitor(
         &mut self,
-        watch_result: Arc<Mutex<dyn WatchResult>>,
-        kv_operator: Arc<Mutex<dyn KVOperator>>,
+        watch_result: Arc<Mutex<dyn WatchResult + Send + Sync>>,
+        kv_operator: Arc<Mutex<dyn KVOperator + Send + Sync>>,
     ) -> Result<()> {
         info!("Starting watching for changes on {:?}", self.watcher);
 
@@ -394,6 +394,7 @@ mod tests {
             }
         }
 
+        // vec![VarPathSpec::SingleVar("local/node/leased".into())]
         let w = Arc::new(Mutex::new(Watcher::default()));
         let o = Arc::new(Mutex::new(Operator {
             operation: Some(Operation::Set {
@@ -403,26 +404,28 @@ mod tests {
             }),
         }));
 
-        // vec![VarPathSpec::SingleVar("local/node/leased".into())]
+        let t = tokio::spawn(async move {
+            match tokio::time::timeout(Duration::from_secs(5), client.monitor(w.clone(), o.clone()))
+                .await
+            {
+                Ok(res) => {
+                    panic!("Unexpected termination occurred: {:?}", res);
+                }
+                Err(_) => {
+                    assert_eq!(
+                        w.lock().await.watch_result,
+                        Operation::Set {
+                            key: "local/node/leased".into(),
+                            value: "new_leased".into(),
+                            with_lease: true,
+                        }
+                    );
+                    assert_eq!(w.lock().await.counter, 3);
+                }
+            }
+        });
 
-        match tokio::time::timeout(Duration::from_secs(5), client.monitor(w.clone(), o.clone()))
-            .await
-        {
-            Ok(res) => {
-                panic!("Unexpected termination occurred: {:?}", res);
-            }
-            Err(_) => {
-                assert_eq!(
-                    w.lock().await.watch_result,
-                    Operation::Set {
-                        key: "local/node/leased".into(),
-                        value: "new_leased".into(),
-                        with_lease: true,
-                    }
-                );
-                assert_eq!(w.lock().await.counter, 3);
-            }
-        }
+        tokio::join!(t).0?;
 
         Ok(())
     }
