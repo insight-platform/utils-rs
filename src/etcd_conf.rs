@@ -137,6 +137,10 @@ impl VarPathSpec {
 }
 
 impl ConfClient {
+    pub fn get_lease_(&self) -> Option<i64> {
+        self.lease_id.clone()
+    }
+
     pub async fn new(
         uris: Vec<String>,
         credentials: Option<(String, String)>,
