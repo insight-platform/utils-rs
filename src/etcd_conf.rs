@@ -14,8 +14,9 @@
  * limitations under the License.
  */
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Mutex;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -271,7 +272,7 @@ impl ConfClient {
                             if let Some(kv) = event.kv() {
                                 watch_result
                                     .lock()
-                                    .unwrap()
+                                    .await
                                     .notify(Operation::DelKey {
                                         key: kv.key_str()?.into(),
                                     })
@@ -283,7 +284,7 @@ impl ConfClient {
                             if let Some(kv) = event.kv() {
                                 watch_result
                                     .lock()
-                                    .unwrap()
+                                    .await
                                     .notify(Operation::Set {
                                         key: kv.key_str()?.to_string(),
                                         value: kv.value_str()?.to_string(),
@@ -298,7 +299,7 @@ impl ConfClient {
                 }
             }
 
-            let ops = kv_operator.lock().unwrap().ops().await?;
+            let ops = kv_operator.lock().await.ops().await?;
             self.kv_operations(ops).await?;
         }
     }
@@ -310,8 +311,9 @@ mod tests {
     use anyhow::Result;
     use async_trait::async_trait;
     use log::info;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use std::time::Duration;
+    use tokio::sync::Mutex;
 
     #[tokio::test]
     async fn test_monitor() -> Result<()> {
@@ -411,14 +413,14 @@ mod tests {
             }
             Err(_) => {
                 assert_eq!(
-                    w.lock().unwrap().watch_result,
+                    w.lock().await.watch_result,
                     Operation::Set {
                         key: "local/node/leased".into(),
                         value: "new_leased".into(),
                         with_lease: true,
                     }
                 );
-                assert_eq!(w.lock().unwrap().counter, 3);
+                assert_eq!(w.lock().await.counter, 3);
             }
         }
 
