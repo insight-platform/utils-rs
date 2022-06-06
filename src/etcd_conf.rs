@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -238,24 +239,10 @@ impl ConfClient {
 
     pub async fn monitor(
         &mut self,
-        // var_spec: Vec<VarPathSpec>,
-        watch_result: &mut dyn WatchResult,
-        kv_operator: &mut dyn KVOperator,
+        watch_result: Arc<Mutex<dyn WatchResult>>,
+        kv_operator: Arc<Mutex<dyn KVOperator>>,
     ) -> Result<()> {
         info!("Starting watching for changes on {:?}", self.watcher);
-
-        // let res = self
-        //     .fetch_vars(&var_spec)
-        //     .await?
-        //     .iter()
-        //     .map(|(k, v)| Operation::Set {
-        //         key: k.clone(),
-        //         value: v.clone(),
-        //         with_lease: false,
-        //     })
-        //     .collect();
-        //
-        // watch_result.notify(res).await?;
 
         if self.lease_id.is_none() {
             let lease = self.client.lease_grant(self.lease_timeout, None).await?;
@@ -283,6 +270,8 @@ impl ConfClient {
                         if EventType::Delete == event.event_type() {
                             if let Some(kv) = event.kv() {
                                 watch_result
+                                    .lock()
+                                    .unwrap()
                                     .notify(Operation::DelKey {
                                         key: kv.key_str()?.into(),
                                     })
@@ -293,6 +282,8 @@ impl ConfClient {
                         if EventType::Put == event.event_type() {
                             if let Some(kv) = event.kv() {
                                 watch_result
+                                    .lock()
+                                    .unwrap()
                                     .notify(Operation::Set {
                                         key: kv.key_str()?.to_string(),
                                         value: kv.value_str()?.to_string(),
@@ -307,7 +298,7 @@ impl ConfClient {
                 }
             }
 
-            let ops = kv_operator.ops().await?;
+            let ops = kv_operator.lock().unwrap().ops().await?;
             self.kv_operations(ops).await?;
         }
     }
@@ -319,6 +310,7 @@ mod tests {
     use anyhow::Result;
     use async_trait::async_trait;
     use log::info;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     #[tokio::test]
@@ -400,31 +392,33 @@ mod tests {
             }
         }
 
-        let mut w = Watcher::default();
-        let mut o = Operator {
+        let w = Arc::new(Mutex::new(Watcher::default()));
+        let o = Arc::new(Mutex::new(Operator {
             operation: Some(Operation::Set {
                 key: "local/node/leased".into(),
                 value: "new_leased".into(),
                 with_lease: true,
             }),
-        };
+        }));
 
         // vec![VarPathSpec::SingleVar("local/node/leased".into())]
 
-        match tokio::time::timeout(Duration::from_secs(5), client.monitor(&mut w, &mut o)).await {
+        match tokio::time::timeout(Duration::from_secs(5), client.monitor(w.clone(), o.clone()))
+            .await
+        {
             Ok(res) => {
                 panic!("Unexpected termination occurred: {:?}", res);
             }
             Err(_) => {
                 assert_eq!(
-                    w.watch_result,
+                    w.lock().unwrap().watch_result,
                     Operation::Set {
                         key: "local/node/leased".into(),
                         value: "new_leased".into(),
                         with_lease: true,
                     }
                 );
-                assert_eq!(w.counter, 3);
+                assert_eq!(w.lock().unwrap().counter, 3);
             }
         }
 
